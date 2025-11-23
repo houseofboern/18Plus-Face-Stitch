@@ -98,7 +98,7 @@ export const generateFaceSwap = async (
       1. IDENTITY TRANSFER: Seamlessly integrate the facial features of IMAGE 2 into the head/body of IMAGE 1.
       2. PHOTOREALISM (CRITICAL): The new face MUST match the exact lighting direction, color temperature, skin tone, ISO noise, and film grain of IMAGE 1. It must NOT look like a smooth sticker.
       3. GEOMETRY (CRITICAL): The output MUST maintain the EXACT dimensions, zoom, and composition of IMAGE 1. Do NOT crop or zoom in.
-      4. EDGE CONSISTENCY: The outer 5% of pixels at the borders MUST remain identical to IMAGE 1. We will be using a soft-stitch algorithm, so the transition must be invisible at the edges.
+      4. EDGE CONSISTENCY (CRITICAL): The outer 10% of pixels at the borders MUST remain identical to IMAGE 1 (the Base Canvas). We will be using a soft-stitch algorithm, so the transition must be invisible at the edges. Do not modify the background elements.
     `;
 
     const response = await ai.models.generateContent({

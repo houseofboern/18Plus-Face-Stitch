@@ -10,7 +10,8 @@ import {
   ArrowRight,
   Layers,
   Info,
-  Loader2
+  Loader2,
+  MoveHorizontal
 } from 'lucide-react';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { generateFaceSwap } from './services/geminiService';
@@ -38,13 +39,23 @@ const App: React.FC = () => {
   const [selection, setSelection] = useState<SelectionBox | null>(null);
   
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
-  const [isUploading, setIsUploading] = useState<boolean>(false); // New state for image processing
+  const [isUploading, setIsUploading] = useState<boolean>(false); 
   const [resultImage, setResultImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // For managing the stitched canvas
-  const stitchedCanvasRef = useRef<HTMLCanvasElement>(null);
-  // Refs for file inputs to clear them after selection
+  // --- Slider State ---
+  const [sliderPosition, setSliderPosition] = useState<number>(50); // 0 to 100%
+  const [isDraggingSlider, setIsDraggingSlider] = useState<boolean>(false);
+
+  // --- Canvas Refs ---
+  // Display canvas (visible to user)
+  const displayCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Hidden canvas storing the finalized STITCHED composite (Full Reference + Feathered Patch)
+  const offscreenResultRef = useRef<HTMLCanvasElement | null>(null);
+  // Cache the Reference Image element so we don't reload it every render frame
+  const refImageElementRef = useRef<HTMLImageElement | null>(null);
+  
+  // Refs for file inputs
   const charInputRef = useRef<HTMLInputElement>(null);
   const refInputRef = useRef<HTMLInputElement>(null);
 
@@ -73,7 +84,6 @@ const App: React.FC = () => {
     if (window.aistudio) {
       try {
         await window.aistudio.openSelectKey();
-        // Double check if it actually worked
         const hasKey = await window.aistudio.hasSelectedApiKey();
         console.log("User selected key. Verified?", hasKey);
         setApiKeyReady(hasKey);
@@ -85,63 +95,69 @@ const App: React.FC = () => {
     }
   };
 
-  // Stitching Logic
+  // --- Stitching & Rendering Logic ---
+
+  // Helper to load image
+  const loadImage = (src: string): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("Failed to load image data"));
+        img.src = src;
+    });
+  };
+
+  // 1. STITCH GENERATION
+  // Runs ONLY when a new result comes in. 
+  // Creates the 'offscreenResultRef' containing the seamlessly blended final image.
   useEffect(() => {
     if (!resultImage || !referenceImage || !selection) return;
 
     let isMounted = true;
-    const canvas = stitchedCanvasRef.current;
-    
-    const loadImage = (src: string): Promise<HTMLImageElement> => {
-        return new Promise((resolve, reject) => {
-            const img = new Image();
-            img.crossOrigin = "anonymous";
-            img.onload = () => resolve(img);
-            img.onerror = () => reject(new Error("Failed to load image data"));
-            img.src = src;
-        });
-    };
 
-    const performStitch = async () => {
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        console.log("Starting stitch process with feathering...");
-
+    const createComposite = async () => {
         try {
-            const [baseImg, patchImg] = await Promise.all([
-                loadImage(referenceImage),
-                loadImage(resultImage)
-            ]);
+            console.log("Creating composite with feathering...");
+            
+            // Load base if not cached
+            let baseImg = refImageElementRef.current;
+            if (!baseImg || baseImg.src !== referenceImage) {
+                baseImg = await loadImage(referenceImage);
+                refImageElementRef.current = baseImg;
+            }
+
+            const patchImg = await loadImage(resultImage);
 
             if (!isMounted) return;
 
-            // Set canvas size to match the original reference image
+            // Prepare Offscreen Canvas for the Final Composite
+            const canvas = document.createElement('canvas');
             canvas.width = baseImg.naturalWidth;
             canvas.height = baseImg.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
 
-            // 1. Draw original Reference (Background)
+            // A. Draw Background (Original)
             ctx.drawImage(baseImg, 0, 0);
 
-            // 2. Prepare Feathered Patch
-            // We create a soft alpha mask (vignette) to blend the edges of the AI patch
-            // into the background, removing the "hard square" look.
+            // B. Prepare Feathered Patch
+            // We create a soft alpha mask (vignette) to blend the edges
             const patchW = patchImg.naturalWidth;
             const patchH = patchImg.naturalHeight;
             
-            const offscreen = document.createElement('canvas');
-            offscreen.width = patchW;
-            offscreen.height = patchH;
-            const oCtx = offscreen.getContext('2d');
-            if (!oCtx) return;
+            const patchCanvas = document.createElement('canvas');
+            patchCanvas.width = patchW;
+            patchCanvas.height = patchH;
+            const pCtx = patchCanvas.getContext('2d');
+            if (!pCtx) return;
 
             // Draw raw patch
-            oCtx.drawImage(patchImg, 0, 0);
+            pCtx.drawImage(patchImg, 0, 0);
 
-            // Create Mask
-            // Use destination-in to keep only the parts we want (opaque center, transparent edges)
-            oCtx.globalCompositeOperation = 'destination-in';
+            // Mask Logic (Destination-In)
+            // Keep opaque center, fade edges to transparent
+            pCtx.globalCompositeOperation = 'destination-in';
 
             const maskCanvas = document.createElement('canvas');
             maskCanvas.width = patchW;
@@ -149,301 +165,175 @@ const App: React.FC = () => {
             const mCtx = maskCanvas.getContext('2d');
             if (!mCtx) return;
 
-            // Define feather amount (15% of the image)
+            // Feathering Amount (15% of size) prevents hard lines
             const feather = Math.min(patchW, patchH) * 0.15;
 
-            // Clear mask
+            // Clear mask (transparent)
             mCtx.clearRect(0, 0, patchW, patchH);
             
-            // We construct a composite gradient mask for a rounded-square vignette
-            
-            // Center (Opaque)
+            // 1. Solid Center
             mCtx.fillStyle = 'white';
             mCtx.fillRect(feather, feather, patchW - (feather * 2), patchH - (feather * 2));
 
-            // Gradients for Edges
+            // 2. Gradients for Edges
             const drawGradient = (x: number, y: number, w: number, h: number, x0: number, y0: number, x1: number, y1: number) => {
                 const g = mCtx.createLinearGradient(x0, y0, x1, y1);
-                g.addColorStop(0, 'rgba(255,255,255,0)'); // Transparent at outer edge
-                g.addColorStop(1, 'rgba(255,255,255,1)'); // Opaque towards center
+                g.addColorStop(0, 'rgba(255,255,255,0)');
+                g.addColorStop(1, 'rgba(255,255,255,1)');
                 mCtx.fillStyle = g;
                 mCtx.fillRect(x, y, w, h);
             };
 
-            // Top Edge (fading up)
+            // Top
             drawGradient(feather, 0, patchW - feather*2, feather, 0, 0, 0, feather);
-            // Bottom Edge (fading down)
+            // Bottom
             drawGradient(feather, patchH - feather, patchW - feather*2, feather, 0, patchH, 0, patchH - feather);
-            // Left Edge (fading left)
+            // Left
             drawGradient(0, feather, feather, patchH - feather*2, 0, 0, feather, 0);
-            // Right Edge (fading right)
+            // Right
             drawGradient(patchW - feather, feather, feather, patchH - feather*2, patchW, 0, patchW - feather, 0);
 
-            // Corners (Radial for softness)
-            const drawCorner = (centerX: number, centerY: number, rectX: number, rectY: number) => {
-                const g = mCtx.createRadialGradient(centerX, centerY, 0, centerX, centerY, feather);
+            // 3. Corners (Radial)
+            const drawCorner = (cx: number, cy: number, rx: number, ry: number) => {
+                const g = mCtx.createRadialGradient(cx, cy, 0, cx, cy, feather);
                 g.addColorStop(0, 'rgba(255,255,255,1)');
                 g.addColorStop(1, 'rgba(255,255,255,0)');
                 mCtx.fillStyle = g;
-                mCtx.fillRect(rectX, rectY, feather, feather);
+                mCtx.fillRect(rx, ry, feather, feather);
             };
+            drawCorner(feather, feather, 0, 0); // TL
+            drawCorner(patchW - feather, feather, patchW - feather, 0); // TR
+            drawCorner(feather, patchH - feather, 0, patchH - feather); // BL
+            drawCorner(patchW - feather, patchH - feather, patchW - feather, patchH - feather); // BR
 
-            // Top-Left
-            drawCorner(feather, feather, 0, 0);
-            // Top-Right
-            drawCorner(patchW - feather, feather, patchW - feather, 0);
-            // Bottom-Left
-            drawCorner(feather, patchH - feather, 0, patchH - feather);
-            // Bottom-Right
-            drawCorner(patchW - feather, patchH - feather, patchW - feather, patchH - feather);
+            // Apply Mask to Patch
+            pCtx.drawImage(maskCanvas, 0, 0);
 
-            // Apply the generated mask to the patch
-            oCtx.drawImage(maskCanvas, 0, 0);
+            // C. Draw Feathered Patch onto Composite
+            // Use high quality interpolation
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
 
-            // 3. Draw the Blended Patch onto the Main Canvas
             const targetX = Math.round(selection.x);
             const targetY = Math.round(selection.y);
             const targetW = Math.round(selection.width);
             const targetH = Math.round(selection.height);
 
-            console.log(`Drawing blended patch at: ${targetX}, ${targetY}`);
-            
-            // Ensure high quality downscaling/upscaling
-            ctx.imageSmoothingEnabled = true;
-            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(patchCanvas, targetX, targetY, targetW, targetH);
 
-            ctx.drawImage(
-                offscreen, 
-                targetX, 
-                targetY, 
-                targetW, 
-                targetH
-            );
+            // Store result
+            offscreenResultRef.current = canvas;
             
-            console.log("Stitch complete.");
+            // Force a re-render of the display
+            requestAnimationFrame(renderDisplay);
 
         } catch (err) {
-            console.error("Stitching failed:", err);
-            if (isMounted) {
-                setError("Failed to render the final result. The generated image data may be corrupted.");
-            }
+            console.error("Composite generation failed:", err);
+            setError("Failed to create comparison view.");
         }
     };
 
-    performStitch();
+    createComposite();
 
-    return () => {
-        isMounted = false;
-    };
+    return () => { isMounted = false; };
   }, [resultImage, referenceImage, selection]);
+
+
+  // 2. DISPLAY RENDERING (The Slider Loop)
+  // Runs whenever slider moves or composite is ready
+  const renderDisplay = () => {
+    const canvas = displayCanvasRef.current;
+    if (!canvas || !referenceImage) return;
+
+    // Use cached reference or fail silently (it handles resize on next frame)
+    const baseImg = refImageElementRef.current;
+    if (!baseImg) return;
+
+    canvas.width = baseImg.naturalWidth;
+    canvas.height = baseImg.naturalHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    
+    // Draw "Before" (Original Reference) - Full Size
+    ctx.drawImage(baseImg, 0, 0);
+
+    // If we have a result, draw "After" clipped by slider
+    if (offscreenResultRef.current && resultImage) {
+        const splitX = w * (sliderPosition / 100);
+
+        ctx.save();
+        ctx.beginPath();
+        // Clip the right side to show the "After" image
+        // Wait, standard slider: Left = Before? Or Left = After?
+        // Usually: Left = Original, Right = Processed.
+        // Let's do: 0 to splitX = Original. splitX to width = Result.
+        
+        // Actually, user requested "Before / After".
+        // Let's assume Left Side = Original, Right Side = Result.
+        // So we draw Result, but clip it to start at splitX.
+        
+        // REVERSE: Standard comparison sliders often show "After" on Left and "Before" on Right, or vice versa.
+        // Let's implement: Left Side (0 to splitX) = RESULT (New). Right Side = REFERENCE (Old).
+        // This feels impactful. "Unveil" the change.
+        
+        ctx.rect(0, 0, splitX, h);
+        ctx.clip();
+        ctx.drawImage(offscreenResultRef.current, 0, 0);
+        ctx.restore();
+
+        // Draw Divider Line
+        ctx.beginPath();
+        ctx.moveTo(splitX, 0);
+        ctx.lineTo(splitX, h);
+        ctx.lineWidth = 4 * (baseImg.naturalWidth / 800); // Scale line width with image
+        ctx.strokeStyle = '#ffffff';
+        ctx.shadowColor = 'rgba(0,0,0,0.5)';
+        ctx.shadowBlur = 10;
+        ctx.stroke();
+    }
+  };
+
+  // Re-render when slider moves
+  useEffect(() => {
+    renderDisplay();
+  }, [sliderPosition, resultImage]);
 
 
   // --- Helper Functions ---
 
   const resizeImage = (file: File, maxWidth = 1024): Promise<string> => {
     return new Promise((resolve, reject) => {
-        // Safety timeout in case FileReader hangs
         const timeoutId = setTimeout(() => reject(new Error("Image processing timed out")), 10000);
-
         const reader = new FileReader();
         reader.onload = (event) => {
             const result = event.target?.result;
-            if (typeof result !== 'string') {
-                clearTimeout(timeoutId);
-                reject(new Error("Failed to read file data"));
-                return;
-            }
+            if (typeof result !== 'string') return;
 
             const img = new Image();
             img.onload = () => {
-                try {
-                    const canvas = document.createElement('canvas');
-                    let width = img.width;
-                    let height = img.height;
-
-                    if (width > maxWidth) {
-                        height = Math.round(height * (maxWidth / width));
-                        width = maxWidth;
-                    }
-
-                    canvas.width = width;
-                    canvas.height = height;
-                    
-                    const ctx = canvas.getContext('2d');
-                    if (!ctx) {
-                        throw new Error("Canvas context failed");
-                    }
-                    ctx.drawImage(img, 0, 0, width, height);
-                    
-                    // Use PNG to preserve full quality of source faces
-                    const dataUrl = canvas.toDataURL('image/png');
-                    clearTimeout(timeoutId);
-                    resolve(dataUrl);
-                } catch (e) {
-                    clearTimeout(timeoutId);
-                    reject(e);
+                const canvas = document.createElement('canvas');
+                let width = img.width;
+                let height = img.height;
+                if (width > maxWidth) {
+                    height = Math.round(height * (maxWidth / width));
+                    width = maxWidth;
                 }
-            };
-            img.onerror = () => {
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                    ctx.drawImage(img, 0, 0, width, height);
+                    resolve(canvas.toDataURL('image/png'));
+                }
                 clearTimeout(timeoutId);
-                reject(new Error("Failed to load image for resizing"));
             };
             img.src = result;
         };
-        reader.onerror = () => {
-            clearTimeout(timeoutId);
-            reject(new Error("File reading failed"));
-        };
         reader.readAsDataURL(file);
     });
-  };
-
-
-  // --- Handlers ---
-
-  const handleCharacterUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setIsUploading(true);
-      setError(null);
-      try {
-        const file = e.target.files[0];
-        console.log("Processing character image:", file.name, file.type, file.size);
-        
-        let resizedBase64: string;
-        try {
-             // Try to resize
-             resizedBase64 = await resizeImage(file, 1024);
-        } catch (resizeErr) {
-             console.warn("Resize failed, falling back to original:", resizeErr);
-             // Fallback to basic read if resize fails
-             resizedBase64 = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = (ev) => resolve(ev.target?.result as string);
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-             });
-        }
-        
-        setCharacterImage(resizedBase64);
-        console.log("Character image set successfully.");
-      } catch (err) {
-        console.error("Failed to process image", err);
-        setError("Failed to process character image. Please try a different file.");
-      } finally {
-        setIsUploading(false);
-        // Reset input so same file can be selected again
-        if (charInputRef.current) charInputRef.current.value = '';
-      }
-    }
-  };
-
-  const handleReferenceUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setIsUploading(true);
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        if (typeof ev.target?.result === 'string') {
-          setReferenceImage(ev.target.result);
-          setSelection(null); 
-          setResultImage(null);
-          setIsUploading(false);
-        }
-      };
-      reader.onerror = () => {
-          setError("Failed to load reference image");
-          setIsUploading(false);
-      }
-      reader.readAsDataURL(e.target.files[0]);
-      
-      // Reset input
-      if (refInputRef.current) refInputRef.current.value = '';
-    }
-  };
-
-  const handleGenerate = async () => {
-    if (!characterImage || !referenceImage || !selection) {
-      setError("Please upload both images and select a region on the reference image.");
-      return;
-    }
-
-    // Safety check for empty selection
-    if (selection.width <= 0 || selection.height <= 0) {
-        setError("Invalid selection. Please re-select the area.");
-        return;
-    }
-    
-    // Explicit API Key check before we start
-    if (!apiKeyReady && !process.env.API_KEY) {
-        if (window.aistudio) {
-            await window.aistudio.openSelectKey();
-            const hasKey = await window.aistudio.hasSelectedApiKey();
-            setApiKeyReady(hasKey);
-            if (!hasKey) {
-                setError("No API Key selected. Operation cancelled.");
-                return;
-            }
-        } else {
-            setError("API Key system not found.");
-            return;
-        }
-    }
-
-    setIsGenerating(true);
-    setError(null);
-    setResultImage(null);
-
-    try {
-      console.log("Preparing crop...");
-      // Use Math.round to ensure the crop we send is the exact same pixel dimensions 
-      // as the area we plan to overwrite.
-      const intSelection = {
-        ...selection,
-        x: Math.round(selection.x),
-        y: Math.round(selection.y),
-        width: Math.round(selection.width),
-        height: Math.round(selection.height)
-      };
-
-      // Get crop as PNG to preserve quality/transparency
-      const cropBase64 = await getCroppedImg(referenceImage, intSelection);
-      
-      console.log("Sending to Gemini...");
-      
-      // Create a timeout promise
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Request timed out after 90 seconds. The model is experiencing high traffic.")), 90000)
-      );
-
-      // Race the actual generation against the timeout
-      const generatedImageBase64 = await Promise.race([
-        generateFaceSwap(characterImage, cropBase64),
-        timeoutPromise
-      ]) as string;
-      
-      console.log("Received response from Gemini.");
-      setResultImage(generatedImageBase64);
-    } catch (err: any) {
-      console.error(err);
-      const msg = err.message || "";
-      
-      if (
-          msg.includes("Requested entity was not found") || 
-          msg.includes("403") || 
-          msg.includes("PERMISSION_DENIED") ||
-          msg.includes("API Key is missing")
-      ) {
-         if (window.aistudio) {
-            setError("Access denied or API Key missing. Please reconnect your key.");
-            setApiKeyReady(false);
-         } else {
-             setError("Permission denied. Check your API_KEY.");
-         }
-      } else {
-        setError(msg);
-      }
-    } finally {
-      setIsGenerating(false);
-    }
   };
 
   const getCroppedImg = (imageSrc: string, pixelCrop: SelectionBox): Promise<string> => {
@@ -452,14 +342,11 @@ const App: React.FC = () => {
       image.src = imageSrc;
       image.onload = () => {
         const canvas = document.createElement('canvas');
-        
-        // OPTIMIZATION: Cap max dimension at 1024px for the API payload.
-        // The model (Gemini 3 Pro) typically works at 1K resolution.
-        // Sending a 4K crop just wastes bandwidth and causes timeouts.
         let targetWidth = Math.round(pixelCrop.width);
         let targetHeight = Math.round(pixelCrop.height);
-        const maxDim = 1024;
         
+        // Cap at 1024 for API efficiency
+        const maxDim = 1024;
         if (targetWidth > maxDim || targetHeight > maxDim) {
             const ratio = targetWidth / targetHeight;
             if (targetWidth > targetHeight) {
@@ -480,32 +367,133 @@ const App: React.FC = () => {
           return;
         }
 
-        // Draw with high quality smoothing to ensure the downscaled crop looks good
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
 
-        ctx.drawImage(
-          image,
-          pixelCrop.x,
-          pixelCrop.y,
-          pixelCrop.width,
-          pixelCrop.height,
-          0,
-          0,
-          canvas.width,
-          canvas.height
-        );
-        // Use PNG to preserve all quality and transparency
+        ctx.drawImage(image, pixelCrop.x, pixelCrop.y, pixelCrop.width, pixelCrop.height, 0, 0, canvas.width, canvas.height);
         resolve(canvas.toDataURL('image/png'));
       };
       image.onerror = (e) => reject(e);
     });
   };
 
-  // --- Render ---
+  // --- Handlers ---
+
+  const handleCharacterUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setIsUploading(true);
+      setError(null);
+      try {
+        const file = e.target.files[0];
+        let resizedBase64 = await resizeImage(file, 1024);
+        setCharacterImage(resizedBase64);
+      } catch (err) {
+        console.error("Failed to process image", err);
+        setError("Failed to process character image. Please try a different file.");
+      } finally {
+        setIsUploading(false);
+        if (charInputRef.current) charInputRef.current.value = '';
+      }
+    }
+  };
+
+  const handleReferenceUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setIsUploading(true);
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        if (typeof ev.target?.result === 'string') {
+          setReferenceImage(ev.target.result);
+          // Clear cached element
+          refImageElementRef.current = null;
+          setSelection(null); 
+          setResultImage(null);
+          setSliderPosition(50);
+          setIsUploading(false);
+        }
+      };
+      reader.readAsDataURL(e.target.files[0]);
+      if (refInputRef.current) refInputRef.current.value = '';
+    }
+  };
+
+  const handleGenerate = async () => {
+    if (!characterImage || !referenceImage || !selection) {
+      setError("Please upload both images and select a region.");
+      return;
+    }
+    if (selection.width <= 0 || selection.height <= 0) return;
+    
+    // Check Key
+    if (!apiKeyReady && !process.env.API_KEY) {
+        if (window.aistudio) {
+            await window.aistudio.openSelectKey();
+            const hasKey = await window.aistudio.hasSelectedApiKey();
+            setApiKeyReady(hasKey);
+            if (!hasKey) {
+                setError("No API Key selected.");
+                return;
+            }
+        } else {
+            setError("API Key system not found.");
+            return;
+        }
+    }
+
+    setIsGenerating(true);
+    setError(null);
+    setResultImage(null);
+
+    try {
+      const intSelection = {
+        x: Math.round(selection.x),
+        y: Math.round(selection.y),
+        width: Math.round(selection.width),
+        height: Math.round(selection.height)
+      };
+
+      const cropBase64 = await getCroppedImg(referenceImage, intSelection);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Request timed out. The model is experiencing high traffic.")), 90000)
+      );
+
+      const generatedImageBase64 = await Promise.race([
+        generateFaceSwap(characterImage, cropBase64),
+        timeoutPromise
+      ]) as string;
+      
+      setResultImage(generatedImageBase64);
+    } catch (err: any) {
+      const msg = err.message || "";
+      if (msg.includes("API Key")) setApiKeyReady(false);
+      setError(msg || "Generation failed.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // Slider Mouse Interaction
+  const handleSliderMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isDraggingSlider) {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        setSliderPosition((x / rect.width) * 100);
+    }
+  };
+
+  const handleSliderMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    // Only start drag if clicking near the handle or generally in the container
+    setIsDraggingSlider(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    setSliderPosition((x / rect.width) * 100);
+  };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-gray-100 font-sans">
+    <div className="flex flex-col h-screen bg-gray-900 text-gray-100 font-sans"
+        onMouseUp={() => setIsDraggingSlider(false)}
+        onMouseLeave={() => setIsDraggingSlider(false)}
+    >
       
       {/* Header */}
       <header className="flex items-center justify-between px-6 py-4 bg-gray-950 border-b border-gray-800">
@@ -520,31 +508,18 @@ const App: React.FC = () => {
                 <p className="text-xs text-gray-500">Precision Generative In-painting</p>
             </div>
         </div>
-
         <div className="flex items-center space-x-4">
             {!apiKeyReady ? (
-                <button 
-                    onClick={handleSelectKey}
-                    className="flex items-center px-4 py-2 text-sm font-medium text-banana-900 bg-banana-500 rounded-md hover:bg-banana-400 transition-colors shadow-[0_0_15px_rgba(245,158,11,0.3)]"
-                >
+                <button onClick={handleSelectKey} className="flex items-center px-4 py-2 text-sm font-medium text-banana-900 bg-banana-500 rounded-md hover:bg-banana-400 transition-colors shadow-[0_0_15px_rgba(245,158,11,0.3)]">
                     Connect API Key
                 </button>
             ) : (
-                <button 
-                    onClick={handleSelectKey}
-                    className="flex items-center space-x-2 px-3 py-1.5 bg-gray-900 border border-green-900/50 rounded-full hover:bg-gray-800 transition-colors group"
-                    title="Click to change API Key"
-                >
+                <button onClick={handleSelectKey} className="flex items-center space-x-2 px-3 py-1.5 bg-gray-900 border border-green-900/50 rounded-full hover:bg-gray-800 transition-colors group">
                     <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
                     <span className="text-xs text-green-500 font-medium group-hover:text-green-400">API Key Active</span>
                 </button>
             )}
-            <a 
-                href="https://ai.google.dev/gemini-api/docs/billing" 
-                target="_blank" 
-                rel="noreferrer"
-                className="text-gray-500 hover:text-gray-300 transition-colors"
-            >
+            <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noreferrer" className="text-gray-500 hover:text-gray-300">
                 <Info className="w-5 h-5" />
             </a>
         </div>
@@ -581,23 +556,53 @@ const App: React.FC = () => {
                 ) : (
                     <div className="relative shadow-2xl rounded-sm overflow-hidden border border-gray-800 max-h-full max-w-full">
                        {resultImage ? (
-                           <div className="relative">
+                           <div 
+                                className="relative cursor-col-resize group"
+                                onMouseMove={handleSliderMouseMove}
+                                onMouseDown={handleSliderMouseDown}
+                           >
                                <canvas 
-                                    ref={stitchedCanvasRef} 
-                                    className="max-h-[70vh] w-auto block object-contain"
+                                    ref={displayCanvasRef} 
+                                    className="max-h-[70vh] w-auto block object-contain pointer-events-none"
                                 />
+                                {/* Slider Handle Overlay */}
+                                <div 
+                                    className="absolute inset-0 pointer-events-none"
+                                    style={{
+                                        // We need to position this based on the *displayed* size, 
+                                        // but the canvas is w-auto / max-h.
+                                        // A simple way is to use the same left % as the slider.
+                                        // However, if the canvas doesn't fill the div, this might be off if we rely on the parent div's width.
+                                        // The parent div is 'inline-block' or similar due to canvas being block?
+                                        // Actually, let's just render the handle on the canvas in JS?
+                                        // Or rely on the fact that the div wraps the canvas exactly.
+                                    }}
+                                >
+                                    <div 
+                                        className="absolute top-0 bottom-0 w-1 bg-transparent group-hover:bg-white/20 transition-colors"
+                                        style={{ left: `${sliderPosition}%`, transform: 'translateX(-50%)' }}
+                                    >
+                                        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 bg-white/90 rounded-full shadow-lg flex items-center justify-center text-gray-800">
+                                            <MoveHorizontal className="w-4 h-4" />
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Labels */}
+                                    <div className={`absolute bottom-4 left-4 bg-black/60 text-banana-400 text-xs px-3 py-1 rounded-full backdrop-blur transition-opacity ${sliderPosition < 10 ? 'opacity-0' : 'opacity-100'}`}>
+                                        After
+                                    </div>
+                                    <div className={`absolute bottom-4 right-4 bg-black/60 text-gray-400 text-xs px-3 py-1 rounded-full backdrop-blur transition-opacity ${sliderPosition > 90 ? 'opacity-0' : 'opacity-100'}`}>
+                                        Before
+                                    </div>
+                                </div>
+
                                 <button 
                                     onClick={() => setResultImage(null)}
-                                    className="absolute top-2 right-2 bg-black/70 hover:bg-black text-white p-2 rounded-full backdrop-blur-md transition-all z-20"
+                                    className="absolute top-2 right-2 bg-black/70 hover:bg-black text-white p-2 rounded-full backdrop-blur-md transition-all z-20 pointer-events-auto"
                                     title="Undo / Clear Result"
                                 >
                                     <RefreshCw className="w-4 h-4" />
                                 </button>
-                                <div className="absolute bottom-4 left-0 right-0 text-center pointer-events-none">
-                                    <span className="bg-black/70 backdrop-blur-sm text-banana-400 text-xs px-3 py-1 rounded-full border border-banana-500/30 shadow-lg">
-                                        Generative Patch Applied
-                                    </span>
-                                </div>
                            </div>
                        ) : (
                            <SelectionOverlay 
@@ -621,7 +626,7 @@ const App: React.FC = () => {
 
         {/* Right Panel: Source & Controls */}
         <div className="w-full lg:w-96 bg-gray-950 p-6 flex flex-col gap-6 overflow-y-auto z-10 shadow-xl">
-            
+            {/* Same source panel as before, just kept cleaner */}
             <div className="space-y-3">
                 <div className="flex items-center justify-between">
                     <span className="text-sm font-semibold text-gray-300 uppercase tracking-wider flex items-center gap-2">
@@ -672,7 +677,6 @@ const App: React.FC = () => {
                                     <Loader2 className="w-8 h-8 text-white animate-spin" />
                                 </div>
                             )}
-                            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-all pointer-events-none"></div>
                         </div>
                     )}
                 </div>
@@ -681,20 +685,18 @@ const App: React.FC = () => {
             <div className="h-px bg-gray-800 w-full my-2"></div>
 
             <div className="flex-1 flex flex-col justify-end space-y-4">
-                
+                {/* Progress Indicators */}
                 <div className="space-y-3">
                     <div className={`flex items-center space-x-3 p-3 rounded-lg border transition-all ${referenceImage ? 'bg-gray-900 border-gray-700' : 'bg-gray-900/30 border-gray-800 opacity-50'}`}>
                         <div className={`w-2 h-2 rounded-full ${referenceImage ? 'bg-banana-500' : 'bg-gray-700'}`}></div>
                         <span className="text-sm text-gray-300">1. Reference Image</span>
                         {referenceImage && <CheckCircle2 className="w-4 h-4 text-banana-500 ml-auto" />}
                     </div>
-
                     <div className={`flex items-center space-x-3 p-3 rounded-lg border transition-all ${selection ? 'bg-gray-900 border-gray-700' : 'bg-gray-900/30 border-gray-800 opacity-50'}`}>
                         <div className={`w-2 h-2 rounded-full ${selection ? 'bg-banana-500' : 'bg-gray-700'}`}></div>
                         <span className="text-sm text-gray-300">2. Select Target Area</span>
                         {selection && <CheckCircle2 className="w-4 h-4 text-banana-500 ml-auto" />}
                     </div>
-
                     <div className={`flex items-center space-x-3 p-3 rounded-lg border transition-all ${characterImage ? 'bg-gray-900 border-gray-700' : 'bg-gray-900/30 border-gray-800 opacity-50'}`}>
                         <div className={`w-2 h-2 rounded-full ${characterImage ? 'bg-blue-500' : 'bg-gray-700'}`}></div>
                         <span className="text-sm text-gray-300">3. Source Character</span>
@@ -708,10 +710,7 @@ const App: React.FC = () => {
                         <div className="flex flex-col gap-2 w-full">
                             <p className="text-xs text-red-200 leading-relaxed">{error}</p>
                             {!apiKeyReady && (
-                                <button 
-                                    onClick={handleSelectKey}
-                                    className="self-start text-xs bg-red-800/50 hover:bg-red-800 text-white px-3 py-1 rounded transition-colors"
-                                >
+                                <button onClick={handleSelectKey} className="self-start text-xs bg-red-800/50 hover:bg-red-800 text-white px-3 py-1 rounded transition-colors">
                                     Select New Key
                                 </button>
                             )}
@@ -743,10 +742,6 @@ const App: React.FC = () => {
                         </>
                     )}
                 </button>
-                
-                <p className="text-[10px] text-center text-gray-600">
-                    Powered by gemini-3-pro-image-preview
-                </p>
             </div>
         </div>
 

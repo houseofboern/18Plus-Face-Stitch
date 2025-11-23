@@ -1,0 +1,5 @@
+{
+  "name": "Banana Patch - Surgical Face Swap",
+  "description": "A precision image editing tool that uses Nano Banana Pro to perform high-fidelity face swaps on specific user-selected regions of a reference image.",
+  "requestFramePermissions": []
+}
